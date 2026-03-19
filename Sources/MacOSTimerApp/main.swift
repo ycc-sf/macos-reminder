@@ -465,7 +465,7 @@ struct CountdownMenuBarView: View {
 }
 
 @main
-struct MacOSReminderApp: App {
+struct MacOSTimerApp: App {
     @StateObject private var store = CountdownStore()
 
     init() {

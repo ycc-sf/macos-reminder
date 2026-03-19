@@ -2,16 +2,16 @@
 import PackageDescription
 
 let package = Package(
-    name: "MacOSReminderApp",
+    name: "MacOSTimerApp",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "MacOSReminderApp", targets: ["MacOSReminderApp"])
+        .executable(name: "MacOSTimerApp", targets: ["MacOSTimerApp"])
     ],
     targets: [
         .executableTarget(
-            name: "MacOSReminderApp",
+            name: "MacOSTimerApp",
             path: "Sources"
         )
     ]
