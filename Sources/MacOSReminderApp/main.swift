@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 private enum AppIconStyle {
@@ -10,23 +11,60 @@ private enum AppIconStyle {
     }
 }
 
+private struct GlassCardModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.35), lineWidth: 1)
+            )
+    }
+}
+
+private struct MenuGlassBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .popover
+        view.blendingMode = .behindWindow
+        view.state = .active
+        view.isEmphasized = true
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+private extension View {
+    func glassCard() -> some View {
+        modifier(GlassCardModifier())
+    }
+}
+
 struct CountdownItem: Identifiable {
     let id: UUID
     let originalMinutes: Int
+    let startDate: Date
     let endDate: Date
 
-    init(id: UUID = UUID(), originalMinutes: Int, endDate: Date) {
+    init(id: UUID = UUID(), originalMinutes: Int, startDate: Date, endDate: Date) {
         self.id = id
         self.originalMinutes = originalMinutes
+        self.startDate = startDate
         self.endDate = endDate
     }
 }
 
 @MainActor
 final class CountdownStore: ObservableObject {
+    private static let presetMinutesKey = "preset_minutes"
+    private static let defaultPresetMinutes = [1, 3, 5, 10, 20, 60]
+
     @Published var customMinutesInput = ""
     @Published private(set) var currentTime = Date()
     @Published private(set) var activeCountdowns: [CountdownItem] = []
+    @Published private(set) var presetMinutes: [Int] = defaultPresetMinutes
+    @Published var launchAtLoginEnabled = false
 
     var activeCount: Int { activeCountdowns.count }
 
@@ -35,6 +73,10 @@ final class CountdownStore: ObservableObject {
     private var isPresentingAlert = false
 
     init() {
+        if let saved = UserDefaults.standard.array(forKey: Self.presetMinutesKey) as? [Int], !saved.isEmpty {
+            presetMinutes = saved
+        }
+        launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
         timerCancellable = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
@@ -44,8 +86,9 @@ final class CountdownStore: ObservableObject {
 
     func addCountdown(minutes: Int) {
         guard minutes > 0 else { return }
-        let endDate = Date().addingTimeInterval(TimeInterval(minutes * 60))
-        activeCountdowns.append(CountdownItem(originalMinutes: minutes, endDate: endDate))
+        let startDate = Date()
+        let endDate = startDate.addingTimeInterval(TimeInterval(minutes * 60))
+        activeCountdowns.append(CountdownItem(originalMinutes: minutes, startDate: startDate, endDate: endDate))
     }
 
     func startCustomCountdown() {
@@ -59,6 +102,14 @@ final class CountdownStore: ObservableObject {
         activeCountdowns.removeAll { $0.id == id }
     }
 
+    func countFor(minutes: Int) -> Int {
+        activeCountdowns.reduce(into: 0) { result, item in
+            if item.originalMinutes == minutes {
+                result += 1
+            }
+        }
+    }
+
     func remainingText(for item: CountdownItem, now: Date = Date()) -> String {
         let seconds = max(0, Int(item.endDate.timeIntervalSince(now)))
         let hours = seconds / 3600
@@ -69,6 +120,77 @@ final class CountdownStore: ObservableObject {
             return String(format: "%02d:%02d:%02d", hours, minutes, secs)
         }
         return String(format: "%02d:%02d", minutes, secs)
+    }
+
+    func hoverDetailsText(for item: CountdownItem, now: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        let remainingSeconds = max(0, Int(item.endDate.timeIntervalSince(now)))
+        return "开始：\(formatter.string(from: item.startDate))\n结束：\(formatter.string(from: item.endDate))\n剩余：\(remainingSeconds) 秒"
+    }
+
+    var nearestRemainingSecondsText: String? {
+        guard let nearestItem = activeCountdowns.min(by: { $0.endDate < $1.endDate }) else {
+            return nil
+        }
+        let remainingSeconds = max(0, Int(nearestItem.endDate.timeIntervalSince(currentTime)))
+        return "\(remainingSeconds)"
+    }
+
+    var menuBarSummaryText: String? {
+        guard activeCount > 0 else { return nil }
+        if let nearestRemainingSecondsText {
+            return "\(activeCount)-\(nearestRemainingSecondsText)"
+        }
+        return "\(activeCount)"
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLoginEnabled = enabled
+        } catch {
+            launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "开机自启设置失败"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "我知道了")
+            alert.runModal()
+        }
+    }
+
+    func updatePresetMinutes(from rawText: String) {
+        let separators = CharacterSet(charactersIn: ",， \n\t")
+        let tokens = rawText
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let parsed = tokens.compactMap(Int.init).filter { $0 > 0 }
+        var unique: [Int] = []
+        for minute in parsed where !unique.contains(minute) {
+            unique.append(minute)
+        }
+
+        guard !unique.isEmpty else {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "预设分钟无效"
+            alert.informativeText = "请输入正整数，并用逗号分隔，例如：1,3,5,10"
+            alert.addButton(withTitle: "我知道了")
+            alert.runModal()
+            return
+        }
+
+        presetMinutes = unique
+        UserDefaults.standard.set(unique, forKey: Self.presetMinutesKey)
     }
 
     private func tick() {
@@ -115,31 +237,153 @@ final class CountdownStore: ObservableObject {
 struct CountdownMenuBarView: View {
     @ObservedObject var store: CountdownStore
 
-    private let quickMinutes = [1, 3, 5, 10, 20, 60]
+    @State private var hoveredQuickMinute: Int?
+    @State private var hoveredCountdownID: UUID?
+    @State private var showSettings = false
+    @State private var presetMinutesInput = ""
+
+    private func confirmAndQuit() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确认退出？"
+        alert.informativeText = "退出后将停止所有进行中的倒计时。"
+        alert.addButton(withTitle: "退出")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    private var settingsPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("设置")
+                .font(.headline)
+
+            Text("预设分钟（逗号分隔）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                TextField("例如 1,3,5,10", text: $presetMinutesInput)
+                    .textFieldStyle(.roundedBorder)
+                Button("保存") {
+                    store.updatePresetMinutes(from: presetMinutesInput)
+                    presetMinutesInput = store.presetMinutes.map(String.init).joined(separator: ",")
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Divider()
+
+            Toggle("开机自启", isOn: Binding(
+                get: { store.launchAtLoginEnabled },
+                set: { store.setLaunchAtLogin($0) }
+            ))
+            .toggleStyle(.switch)
+
+            HStack {
+                Spacer()
+                Button("退出") {
+                    showSettings = false
+                    confirmAndQuit()
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(12)
+        .frame(width: 280)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("设置倒计时")
-                    .font(.headline)
-
-                ForEach(quickMinutes, id: \.self) { minute in
-                    Button("\(minute)分") {
-                        store.addCountdown(minutes: minute)
+                HStack {
+                    Text("设置倒计时")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        presetMinutesInput = store.presetMinutes.map(String.init).joined(separator: ",")
+                        showSettings.toggle()
+                    } label: {
+                        Image(systemName: "gearshape")
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.plain)
+                    .help("设置")
+                    .popover(isPresented: $showSettings, arrowEdge: .top) {
+                        settingsPanel
+                    }
+                }
+
+                ForEach(store.presetMinutes, id: \.self) { minute in
+                    let count = store.countFor(minutes: minute)
+                    Button {
+                        store.addCountdown(minutes: minute)
+                    } label: {
+                        HStack {
+                            Text("\(minute) 分钟")
+                                .font(.system(size: 13, weight: .semibold))
+                            Spacer()
+                            if count > 0 {
+                                Text("\(count)")
+                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                            }
+                        }
+                        .foregroundStyle(count > 0 ? Color.white : Color.primary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            Group {
+                                if count > 0 {
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [Color(red: 0.22, green: 0.54, blue: 0.96), Color(red: 0.16, green: 0.46, blue: 0.90)],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+                                } else {
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .fill(.ultraThinMaterial)
+                                }
+                            }
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(.white.opacity(hoveredQuickMinute == minute ? (count > 0 ? 0.16 : 0.28) : 0.0))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(Color.white.opacity(hoveredQuickMinute == minute ? 0.7 : 0.35), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isHovering in
+                        hoveredQuickMinute = isHovering ? minute : nil
+                    }
                 }
 
                 HStack(spacing: 8) {
                     TextField("输入 n 分钟", text: $store.customMinutesInput)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 110)
+                        .textFieldStyle(.plain)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .glassCard()
+                        .submitLabel(.done)
+                        .onSubmit {
+                            store.startCustomCountdown()
+                        }
 
                     Button("开始") {
                         store.startCustomCountdown()
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.bordered)
+                    .controlSize(.regular)
                 }
+                .frame(maxWidth: .infinity)
             }
 
             Divider()
@@ -171,12 +415,52 @@ struct CountdownMenuBarView: View {
                             .buttonStyle(.plain)
                             .help("关闭这个计时")
                         }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(.white.opacity(hoveredCountdownID == item.id ? 0.32 : 0.0))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.white.opacity(hoveredCountdownID == item.id ? 0.45 : 0.0), lineWidth: 1)
+                        )
+                        .onHover { isHovering in
+                            hoveredCountdownID = isHovering ? item.id : nil
+                        }
+                        .overlay(alignment: .topTrailing) {
+                            if hoveredCountdownID == item.id {
+                                Text(store.hoverDetailsText(for: item, now: store.currentTime))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.white)
+                                    .multilineTextAlignment(.leading)
+                                    .lineLimit(nil)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .padding(8)
+                                    .frame(width: 180, alignment: .leading)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .fill(Color.black.opacity(0.72))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .stroke(Color.white.opacity(0.55), lineWidth: 1)
+                                    )
+                                    .shadow(color: .black.opacity(0.35), radius: 8, x: 0, y: 3)
+                                    .offset(x: -8, y: -70)
+                                    .allowsHitTesting(false)
+                                    .transition(.opacity)
+                            }
+                        }
+                        .zIndex(hoveredCountdownID == item.id ? 20 : 0)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .top)), removal: .opacity))
                     }
                 }
             }
         }
         .padding(12)
-        .frame(width: 250)
+        .frame(width: 310)
+        .background(MenuGlassBackground().opacity(0.96))
     }
 }
 
@@ -197,10 +481,11 @@ struct MacOSReminderApp: App {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "hourglass")
-                if store.activeCount > 0 {
-                    Text("\(store.activeCount)")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                if let menuBarSummaryText = store.menuBarSummaryText {
+                    Text(menuBarSummaryText)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .monospacedDigit()
+                        .lineLimit(1)
                 }
             }
         }
