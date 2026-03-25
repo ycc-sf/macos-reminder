@@ -80,6 +80,7 @@ final class CountdownStore: ObservableObject {
     private var timerCancellable: AnyCancellable?
     private var completionQueue: [CountdownItem] = []
     private var isPresentingAlert = false
+    private var completionAlertHostWindow: NSWindow?
 
     init() {
         if let saved = UserDefaults.standard.array(forKey: Self.presetMinutesKey) as? [Int], !saved.isEmpty {
@@ -156,21 +157,17 @@ final class CountdownStore: ObservableObject {
         return "开始：\(formatter.string(from: item.startDate))\n结束：\(formatter.string(from: item.endDate))\n剩余：\(remainingSeconds) 秒"
     }
 
-    var nearestRemainingSecondsText: String? {
+    var nearestRemainingMMSS: String? {
         guard let nearestItem = activeCountdowns.min(by: { $0.endDate < $1.endDate }) else {
             return nil
         }
-        let remainingSeconds = max(0, Int(nearestItem.endDate.timeIntervalSince(currentTime)))
-        return "\(remainingSeconds)"
+        let totalSeconds = max(0, Int(nearestItem.endDate.timeIntervalSince(currentTime)))
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 
-    var menuBarSummaryText: String? {
-        guard activeCount > 0 else { return nil }
-        if let nearestRemainingSecondsText {
-            return "\(activeCount)-\(nearestRemainingSecondsText)"
-        }
-        return "\(activeCount)"
-    }
+    var hasActiveTimers: Bool { activeCount > 0 }
 
     func setLaunchAtLogin(_ enabled: Bool) {
         do {
@@ -240,6 +237,27 @@ final class CountdownStore: ObservableObject {
         presentCompletionAlert(for: item)
     }
 
+    private func hostWindowForCompletionAlert() -> NSWindow {
+        if let existing = completionAlertHostWindow {
+            return existing
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 140),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovable = false
+        window.level = .floating
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isReleasedWhenClosed = false
+        completionAlertHostWindow = window
+        return window
+    }
+
     private func presentCompletionAlert(for item: CountdownItem) {
         isPresentingAlert = true
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -254,14 +272,19 @@ final class CountdownStore: ObservableObject {
         alert.icon = AppIconStyle.hourglass(pointSize: 48)
         alert.addButton(withTitle: localized("Restart \(item.originalMinutes) min", "重新计时 \(item.originalMinutes) 分钟"))
         alert.addButton(withTitle: localized("Got it", "我知道了"))
+        let hostWindow = hostWindowForCompletionAlert()
+        hostWindow.center()
+        hostWindow.makeKeyAndOrderFront(nil)
+        alert.beginSheetModal(for: hostWindow) { [weak self] response in
+            guard let self else { return }
+            if response == .alertFirstButtonReturn {
+                self.addCountdown(minutes: item.originalMinutes)
+            }
 
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            addCountdown(minutes: item.originalMinutes)
+            hostWindow.orderOut(nil)
+            self.isPresentingAlert = false
+            self.processCompletionQueueIfNeeded()
         }
-
-        isPresentingAlert = false
-        processCompletionQueueIfNeeded()
     }
 }
 
@@ -528,11 +551,15 @@ struct MacOSTimerApp: App {
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "hourglass")
-                if let menuBarSummaryText = store.menuBarSummaryText {
-                    Text(menuBarSummaryText)
+                if store.hasActiveTimers {
+                    Text("\(store.activeCount)")
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .monospacedDigit()
-                        .lineLimit(1)
+                        .frame(width: 14, alignment: .trailing)
+                    Text(store.nearestRemainingMMSS ?? "--:--")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .monospacedDigit()
+                        .frame(width: 34, alignment: .leading)
                 }
             }
         }
